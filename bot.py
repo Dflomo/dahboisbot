@@ -19,9 +19,9 @@ Environment variables:
 import asyncio
 import logging
 import os
-import subprocess
+import glob
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import discord
 import yt_dlp
@@ -43,12 +43,17 @@ log.info("Opus loaded: %s", discord.opus.is_loaded())
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = os.getenv("GUILD_ID")
 IDLE_DISCONNECT_SECONDS = 60
+DOWNLOAD_TIMEOUT = 180  # give up on a song if YouTube takes longer than this to deliver it
+DOWNLOAD_DIR = "/tmp/audio"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 YDL_OPTS = {
-    "format": "bestaudio/best",
+    "format": "ba/ba*",  # best audio-only, else best format that has audio
     "noplaylist": True,
     "quiet": True,
-    "no_warnings": True,
+    "no_warnings": False,  # warnings go to the Railway logs
+    "socket_timeout": 20,
+    "noprogress": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
 }
@@ -81,20 +86,12 @@ if os.getenv("YTDLP_COOKIES"):
 
 
 
-def start_audio_download(url: str) -> subprocess.Popen:
-    """Run yt-dlp to stream the audio to stdout, using the same cookies as lookups."""
-    cmd = ["yt-dlp", "--quiet", "--no-warnings", "--no-playlist", "-f", "bestaudio/best", "-o", "-"]
-    if cookie_path:
-        cmd += ["--cookies", cookie_path]
-    cmd.append(url)
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE)
-
-
 async def extract(query: str) -> dict:
     """Look up a URL or search term with yt-dlp, without downloading."""
 
     def run():
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        # The lookup only needs the title, so don't fail it over format availability.
+        with yt_dlp.YoutubeDL(dict(YDL_OPTS, ignore_no_formats_error=True)) as ydl:
             info = ydl.extract_info(query, download=False)
             if info and "entries" in info:
                 entries = [e for e in info["entries"] if e]
@@ -104,6 +101,38 @@ async def extract(query: str) -> dict:
             return info
 
     return await asyncio.get_running_loop().run_in_executor(None, run)
+
+
+async def download(url: str) -> str:
+    """Download a track's audio to a local file and return its path."""
+
+    def run():
+        opts = dict(YDL_OPTS, outtmpl=f"{DOWNLOAD_DIR}/%(id)s.%(ext)s")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info and "entries" in info:
+                info = next(e for e in info["entries"] if e)
+            path = ydl.prepare_filename(info)
+        if not os.path.exists(path):
+            matches = glob.glob(os.path.splitext(path)[0] + ".*")
+            if not matches:
+                raise RuntimeError("Download finished but no audio file was found.")
+            path = matches[0]
+        return path
+
+    fut = asyncio.get_running_loop().run_in_executor(None, run)
+    try:
+        return await asyncio.wait_for(fut, DOWNLOAD_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"YouTube took over {DOWNLOAD_TIMEOUT} seconds to send it, giving up.")
+
+
+def remove_file(path: str | None):
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def fmt_duration(seconds) -> str:
@@ -121,6 +150,12 @@ class Track:
     page_url: str
     duration: int | None
     requester: str
+    download_task: asyncio.Task | None = field(default=None, repr=False)
+
+    def start_download(self) -> asyncio.Task:
+        if self.download_task is None:
+            self.download_task = asyncio.create_task(download(self.page_url))
+        return self.download_task
 
 
 class GuildPlayer:
@@ -149,33 +184,45 @@ class GuildPlayer:
             return
 
         track = self.queue.popleft()
-        proc = None
+        self.current = track  # marks the player busy while the song downloads
         try:
-            proc = start_audio_download(track.page_url)
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(proc.stdout, pipe=True, options="-vn"), volume=self.volume
-            )
+            path = await track.start_download()
         except Exception as e:
-            if proc:
-                proc.kill()
-            log.exception("Failed to load track")
+            log.exception("Failed to download %s", track.page_url)
             await self.announce(f"Couldn't play **{track.title}**: {e}")
             await self.play_next()
             return
 
+        vc = self.guild.voice_client
+        if not vc or not vc.is_connected():
+            remove_file(path)
+            self.current = None
+            return
+
+        source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(path, options="-vn"), volume=self.volume)
+
         def after(err):
             if err:
                 log.error("Playback error: %s", err)
-            if proc.poll() is None:
-                proc.kill()
-            elif proc.returncode:
-                log.error("yt-dlp exited with code %s for %s", proc.returncode, track.page_url)
+            remove_file(path)
             asyncio.run_coroutine_threadsafe(self.play_next(), self.bot.loop)
 
-        self.current = track
         vc.play(source, after=after)
+        self.prefetch()
         await self.announce(f"Now playing: **{track.title}** ({fmt_duration(track.duration)}), requested by {track.requester}")
 
+    def prefetch(self):
+        """Start downloading the next song while the current one plays."""
+        if self.queue:
+            self.queue[0].start_download()
+
+    def clear(self):
+        for t in self.queue:
+            if t.download_task:
+                t.download_task.add_done_callback(
+                    lambda task: remove_file(task.result()) if not task.cancelled() and not task.exception() else None
+                )
+        self.queue.clear()
 
 class MusicBot(discord.Client):
     def __init__(self):
@@ -213,7 +260,7 @@ class MusicBot(discord.Client):
         vc = member.guild.voice_client
         if vc and vc.channel and not any(not m.bot for m in vc.channel.members):
             p = self.player(member.guild)
-            p.queue.clear()
+            p.clear()
             await vc.disconnect()
             await p.announce("Everyone left, so I disconnected.")
 
@@ -259,10 +306,11 @@ async def play(interaction: discord.Interaction, query: str):
     )
     p.queue.append(track)
 
-    if not vc.is_playing() and not vc.is_paused():
-        await interaction.followup.send(f"Loading **{track.title}**...")
+    if not vc.is_playing() and not vc.is_paused() and p.current is None:
+        await interaction.followup.send(f"Downloading **{track.title}**, starting in a few seconds...")
         await p.play_next()
     else:
+        p.prefetch()
         await interaction.followup.send(f"Queued **{track.title}** (position {len(p.queue)})")
 
 
@@ -299,7 +347,7 @@ async def resume(interaction: discord.Interaction):
 @bot.tree.command(description="Stop playback and clear the queue")
 async def stop(interaction: discord.Interaction):
     p = bot.player(interaction.guild)
-    p.queue.clear()
+    p.clear()
     vc = interaction.guild.voice_client
     if vc:
         vc.stop()
@@ -334,7 +382,7 @@ async def volume(interaction: discord.Interaction, level: app_commands.Range[int
 async def leave(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc:
-        bot.player(interaction.guild).queue.clear()
+        bot.player(interaction.guild).clear()
         await vc.disconnect()
         await interaction.response.send_message("Bye!")
     else:
