@@ -44,12 +44,30 @@ YDL_OPTS = {
     "source_address": "0.0.0.0",
 }
 
+def write_cookie_file(raw: str, path: str) -> int:
+    """Save pasted cookies.txt contents, repairing tabs that got turned into spaces."""
+    lines = ["# Netscape HTTP Cookie File"]
+    count = 0
+    for line in raw.replace("\r", "").split("\n"):
+        line = line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            parts = line.split(None, 6)
+        if len(parts) == 7:
+            lines.append("\t".join(parts))
+            count += 1
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return count
+
+
 if os.getenv("YTDLP_COOKIES"):
     cookie_path = "/tmp/cookies.txt"
-    with open(cookie_path, "w", encoding="utf-8") as f:
-        f.write(os.environ["YTDLP_COOKIES"])
+    n = write_cookie_file(os.environ["YTDLP_COOKIES"], cookie_path)
     YDL_OPTS["cookiefile"] = cookie_path
-    log.info("Using YouTube cookies from YTDLP_COOKIES")
+    log.info("Loaded %d YouTube cookies from YTDLP_COOKIES", n)
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
