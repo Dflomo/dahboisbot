@@ -12,7 +12,7 @@ Slash commands:
 
 Environment variables:
   DISCORD_TOKEN   (required) your bot token
-  GUILD_ID        (optional) your server ID, makes slash commands appear instantly
+  GUILD_ID        (optional) server ID(s), comma-separated; makes slash commands appear instantly
   YTDLP_COOKIES   (optional) contents of a cookies.txt file, only if YouTube blocks the host
 """
 
@@ -46,7 +46,6 @@ IDLE_DISCONNECT_SECONDS = 60
 DOWNLOAD_TIMEOUT = 180  # give up on a song if YouTube takes longer than this to deliver it
 DOWNLOAD_DIR = "/tmp/audio"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
 YDL_OPTS = {
     "format": "ba/ba*",  # best audio-only, else best format that has audio
     "noplaylist": True,
@@ -83,7 +82,6 @@ if os.getenv("YTDLP_COOKIES"):
     n = write_cookie_file(os.environ["YTDLP_COOKIES"], cookie_path)
     YDL_OPTS["cookiefile"] = cookie_path
     log.info("Loaded %d YouTube cookies from YTDLP_COOKIES", n)
-
 
 
 async def extract(query: str) -> dict:
@@ -230,7 +228,6 @@ class MusicBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.players: dict[int, GuildPlayer] = {}
-
     def player(self, guild: discord.Guild) -> GuildPlayer:
         if guild.id not in self.players:
             self.players[guild.id] = GuildPlayer(self, guild)
@@ -238,10 +235,15 @@ class MusicBot(discord.Client):
 
     async def setup_hook(self):
         if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            log.info("Slash commands synced to server %s", GUILD_ID)
+            # GUILD_ID can be one server ID or several separated by commas.
+            for gid in [g.strip() for g in GUILD_ID.split(",") if g.strip()]:
+                guild = discord.Object(id=int(gid))
+                self.tree.copy_global_to(guild=guild)
+                try:
+                    await self.tree.sync(guild=guild)
+                    log.info("Slash commands synced to server %s", gid)
+                except discord.HTTPException as e:
+                    log.error("Couldn't sync commands to server %s (is the bot in it?): %s", gid, e)
         else:
             await self.tree.sync()
             log.info("Slash commands synced globally (can take up to an hour to appear)")
