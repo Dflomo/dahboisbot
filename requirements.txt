@@ -1,0 +1,3 @@
+discord.py[voice]>=2.7.1
+davey
+yt-dlp[default]
