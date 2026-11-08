@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # ffmpeg converts the audio for Discord
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg libopus0 \
     && rm -rf /var/lib/apt/lists/*
 
 # yt-dlp needs a JavaScript runtime to read YouTube pages reliably

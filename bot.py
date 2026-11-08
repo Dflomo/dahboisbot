@@ -19,9 +19,9 @@ Environment variables:
 import asyncio
 import logging
 import os
-import time
+import subprocess
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import discord
 import yt_dlp
@@ -30,10 +30,19 @@ from discord import app_commands
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("musicbot")
 
+# Discord voice needs the Opus encoder; load it explicitly so it can't silently go missing.
+if not discord.opus.is_loaded():
+    for name in ("libopus.so.0", "libopus.so", "opus"):
+        try:
+            discord.opus.load_opus(name)
+            break
+        except OSError:
+            continue
+log.info("Opus loaded: %s", discord.opus.is_loaded())
+
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = os.getenv("GUILD_ID")
 IDLE_DISCONNECT_SECONDS = 60
-STREAM_URL_MAX_AGE = 300  # YouTube stream links expire, so refetch if older than this
 
 YDL_OPTS = {
     "format": "bestaudio/best",
@@ -63,16 +72,22 @@ def write_cookie_file(raw: str, path: str) -> int:
     return count
 
 
+cookie_path = None
 if os.getenv("YTDLP_COOKIES"):
     cookie_path = "/tmp/cookies.txt"
     n = write_cookie_file(os.environ["YTDLP_COOKIES"], cookie_path)
     YDL_OPTS["cookiefile"] = cookie_path
     log.info("Loaded %d YouTube cookies from YTDLP_COOKIES", n)
 
-FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
+
+
+def start_audio_download(url: str) -> subprocess.Popen:
+    """Run yt-dlp to stream the audio to stdout, using the same cookies as lookups."""
+    cmd = ["yt-dlp", "--quiet", "--no-warnings", "--no-playlist", "-f", "bestaudio/best", "-o", "-"]
+    if cookie_path:
+        cmd += ["--cookies", cookie_path]
+    cmd.append(url)
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE)
 
 
 async def extract(query: str) -> dict:
@@ -106,8 +121,6 @@ class Track:
     page_url: str
     duration: int | None
     requester: str
-    stream_url: str | None = None
-    fetched_at: float = field(default_factory=time.time)
 
 
 class GuildPlayer:
@@ -136,15 +149,15 @@ class GuildPlayer:
             return
 
         track = self.queue.popleft()
+        proc = None
         try:
-            if not track.stream_url or time.time() - track.fetched_at > STREAM_URL_MAX_AGE:
-                info = await extract(track.page_url)
-                track.stream_url = info["url"]
-                track.fetched_at = time.time()
+            proc = start_audio_download(track.page_url)
             source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTS), volume=self.volume
+                discord.FFmpegPCMAudio(proc.stdout, pipe=True, options="-vn"), volume=self.volume
             )
         except Exception as e:
+            if proc:
+                proc.kill()
             log.exception("Failed to load track")
             await self.announce(f"Couldn't play **{track.title}**: {e}")
             await self.play_next()
@@ -153,6 +166,10 @@ class GuildPlayer:
         def after(err):
             if err:
                 log.error("Playback error: %s", err)
+            if proc.poll() is None:
+                proc.kill()
+            elif proc.returncode:
+                log.error("yt-dlp exited with code %s for %s", proc.returncode, track.page_url)
             asyncio.run_coroutine_threadsafe(self.play_next(), self.bot.loop)
 
         self.current = track
@@ -239,7 +256,6 @@ async def play(interaction: discord.Interaction, query: str):
         page_url=info.get("webpage_url") or query,
         duration=info.get("duration"),
         requester=interaction.user.display_name,
-        stream_url=info.get("url"),
     )
     p.queue.append(track)
 
